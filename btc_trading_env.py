@@ -23,11 +23,11 @@ class BTCTradingEnv(gym.Env):
 
     def _get_obs(self):
         row = self.df.iloc[self.current_step]
-        # Debug: print the row to check its contents
-        print(f"DEBUG _get_obs row: {row}")
-        # Use .item() to extract scalar if value is a Series
+        # Use .iloc[0] if value is a Series, to avoid FutureWarning and TypeError
         def get_scalar(val):
-            if isinstance(val, (np.ndarray, pd.Series)):
+            if isinstance(val, pd.Series):
+                return float(val.iloc[0])
+            if isinstance(val, np.ndarray):
                 return float(val.item())
             return float(val) if pd.notnull(val) else 0.0
         close = get_scalar(row['Close'])
@@ -74,4 +74,7 @@ class BTCTradingEnv(gym.Env):
         return next_obs, reward, terminated, truncated, info
 
     def render(self):
-        print(f"Step: {self.current_step}, Balance: {self.balance:.2f}, BTC: {self.btc_held:.6f}")
+        # Ensure balance and btc_held are always floats for formatting
+        balance = float(self.balance)
+        btc_held = float(self.btc_held)
+        print(f"Step: {self.current_step}, Balance: {balance:.2f}, BTC: {btc_held:.6f}")
