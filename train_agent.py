@@ -6,5 +6,5 @@ df = get_btc_data()
 env = BTCTradingEnv(df)
 
 model = PPO("MlpPolicy", env, verbose=1)
-model.learn(total_timesteps=10_000)
+model.learn(total_timesteps=80_000)
 model.save("ppo_btc_trend")
