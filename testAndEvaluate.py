@@ -1,10 +1,10 @@
 from stable_baselines3 import PPO
 from btc_trading_env import BTCTradingEnv
-from prepare_data import get_btc_data
+import pandas as pd
 
-# Prepare data and environment
-
-df = get_btc_data()
+# Load data from CSV file
+csv_path = "binance_btc_1m.csv"
+df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
 env = BTCTradingEnv(df)
 
 # Load the trained model
