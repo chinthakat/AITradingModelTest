@@ -3,7 +3,7 @@ from btc_trading_env import BTCTradingEnv
 import pandas as pd
 
 # Load data from CSV file
-csv_path = "binance_btc_1m.csv"
+csv_path = "data/binance_btc_1m.csv"
 df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
 env = BTCTradingEnv(df)
 
@@ -14,6 +14,8 @@ obs, info = env.reset()
 for _ in range(len(df)):
     action, _ = model.predict(obs)
     obs, reward, terminated, truncated, _ = env.step(action)
-    env.render()
+    # Only render/log every 10000 steps
+    if env.current_step % 10000 == 0:
+        env.render()
     if terminated or truncated:
         break

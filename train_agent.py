@@ -14,17 +14,17 @@ if os.path.exists(log_path):
     print(f"Archived old log file to {archive_path}")
 
 # Use Binance 1-minute data for training
-csv_path = "binance_btc_1m.csv"
+csv_path = "data/binance_btc_1m.csv"
 try:
     df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
     print(f"Loaded data from {csv_path}")
 except FileNotFoundError:
-    df = get_binance_1m_data(symbol="BTCUSDT", days=60)
+    df = get_binance_1m_data(symbol="BTCUSDT", months=12, csv_path=csv_path)
     df.to_csv(csv_path)
     print(f"Downloaded and saved data to {csv_path}")
 
 env = BTCTradingEnv(df)
 
 model = PPO("MlpPolicy", env, verbose=1)
-model.learn(total_timesteps=80_000)
+model.learn(total_timesteps=150_000)
 model.save("ppo_btc_trend")
