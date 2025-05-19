@@ -2,6 +2,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
+from collections import deque
+from trading_features import build_observation
 MAX_BUY_FRACTION = 0.05  # 5% of balance
 
 class BTCTradingEnv(gym.Env):
@@ -9,11 +11,13 @@ class BTCTradingEnv(gym.Env):
         super(BTCTradingEnv, self).__init__()
         self.df = df.reset_index(drop=True)
         self.n_steps = len(df)
-        self.action_space = spaces.Discrete(7)  # 0 = Sell All, 1 = Hold, 2 = Buy 1%, 3 = Buy 5%, 4 = Buy 10%, 5 = Buy 25%, 6 = Buy 50%
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)
+        self.action_space = spaces.Discrete(7)
+        # 9 original + 5 last trade profits + 5 SMA_10 + 5 SMA_50 = 24
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(39,), dtype=np.float32)
         self.total_trades = 0
         self.profitable_trades = 0
         self.loss_trades = 0
+        self.last_trade_profits = deque([0.0]*5, maxlen=5)
         self.reset()
 
     def reset(self, *, seed=None, options=None):
@@ -25,30 +29,19 @@ class BTCTradingEnv(gym.Env):
         self.total_trades = 0
         self.profitable_trades = 0
         self.loss_trades = 0
+        self.last_trade_profits = deque([0.0]*5, maxlen=5)
         obs = self._get_obs()
         info = {}
         return obs, info
 
     def _get_obs(self):
-        row = self.df.iloc[self.current_step]
-        def get_scalar(val):
-            if isinstance(val, pd.Series):
-                return float(val.iloc[0])
-            if isinstance(val, np.ndarray):
-                return float(val.item())
-            return float(val) if pd.notnull(val) else 0.0
-
-        return np.array([
-            get_scalar(row['Close']),
-            get_scalar(row['SMA_10']),
-            get_scalar(row['SMA_50']),
-            get_scalar(row['RSI']),
-            get_scalar(row['MACD']),
-            get_scalar(row['MACD_Signal']),
-            float(self.balance),
-            float(self.btc_held),
-            float(self.current_step)
-        ], dtype=np.float32)
+        return build_observation(
+            self.df,
+            self.current_step,
+            self.balance,
+            self.btc_held,
+            self.last_trade_profits
+        )
 
     def step(self, action, log_file="trading_log.txt"):
         # Ensure action is an int (Stable-Baselines3 may pass a numpy array)
@@ -114,6 +107,9 @@ class BTCTradingEnv(gym.Env):
                     self.profitable_trades += 1
                 elif trade_profit < 0:
                     self.loss_trades += 1
+        # After trade_profit is set (after trade_made)
+        if trade_made and trade_profit is not None:
+            self.last_trade_profits.append(trade_profit)
         self.current_step += 1
         next_obs = np.zeros(self.observation_space.shape, dtype=np.float32) if self.current_step >= self.n_steps else self._get_obs()
         # Net worth and drawdown

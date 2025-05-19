@@ -34,68 +34,95 @@ def get_btc_data():
 
     return df.dropna()
 
-def get_binance_1m_data(symbol="BTCUSDT", months=12, csv_path="data/binance_btc_1m.csv"): 
-    if os.path.exists(csv_path):
-        print(f"Loading data from {csv_path}")
-        return pd.read_csv(csv_path, index_col=0, parse_dates=True)
-    client = Client()  # No API key required for public data
-    limit = 1000
-    interval = Client.KLINE_INTERVAL_1MINUTE
-    end_time = datetime.datetime.now()
-    start_time = end_time - datetime.timedelta(days=months*30)
-    data = []
-    chunk_days = 60
-    chunk_start = start_time
-    # Archive existing file if it exists (should not happen, but for safety)
-    if os.path.exists(csv_path):
-        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_path = f"{csv_path.rstrip('.csv')}_archive_{now}.csv"
-        shutil.move(csv_path, archive_path)
-        print(f"Archived old CSV to {archive_path}")
-    first_write = True
-    while chunk_start < end_time:
-        chunk_end = min(chunk_start + datetime.timedelta(days=chunk_days), end_time)
-        start_ts = int(chunk_start.timestamp() * 1000)
-        end_ts = int(chunk_end.timestamp() * 1000)
-        print(f"Fetching data from {chunk_start} to {chunk_end}...")
-        chunk_data = []
-        while start_ts < end_ts:
-            candles = client.get_klines(
-                symbol=symbol,
-                interval=interval,
-                startTime=start_ts,
-                endTime=end_ts,
-                limit=limit
-            )
-            if not candles:
-                break
-            chunk_data.extend(candles)
-            last_open_time = candles[-1][0]
-            start_ts = last_open_time + 60_000  # move to next minute
-            time.sleep(0.5)  # respect API rate limits
-        if chunk_data:
-            df_chunk = pd.DataFrame(chunk_data, columns=[
-                "timestamp", "open", "high", "low", "close", "volume",
-                "close_time", "quote_asset_volume", "number_of_trades",
-                "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
-            ])
-            df_chunk["timestamp"] = pd.to_datetime(df_chunk["timestamp"], unit="ms")
-            df_chunk.set_index("timestamp", inplace=True)
-            df_chunk = df_chunk[["open", "high", "low", "close", "volume"]].astype(float)
-            # Add required features for RL environment
-            df_chunk['Close'] = df_chunk['close']  # Capital C for compatibility
-            df_chunk['SMA_10'] = df_chunk['Close'].rolling(window=10).mean()
-            df_chunk['SMA_50'] = df_chunk['Close'].rolling(window=50).mean()
-            df_chunk['RSI'] = ta.momentum.RSIIndicator(close=df_chunk['Close'], window=14).rsi()
-            macd = ta.trend.MACD(close=df_chunk['Close'])
-            df_chunk['MACD'] = macd.macd()
-            df_chunk['MACD_Signal'] = macd.macd_signal()
-            df_chunk = df_chunk.dropna()
-            df_chunk.to_csv(csv_path, mode='w' if first_write else 'a', header=first_write)
-            first_write = False
-            print(f"Saved chunk to {csv_path} (rows: {len(df_chunk)})")
-        chunk_start = chunk_end
-    # Read the full file back in
-    df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-    print(f"Saved all data to {csv_path}")
-    return df
+def get_binance_1m_data(
+    symbol="BTCUSDT",
+    train_from_date=None,  # format: "YYYYMMDD"
+    train_to_date=None,    # format: "YYYYMMDD"
+    val_from_date=None,    # format: "YYYYMMDD"
+    val_to_date=None,      # format: "YYYYMMDD"
+    csv_path="data/binance_btc_1m.csv",
+    val_csv_path="data/binance_btc_1m_val.csv"
+):
+    def fetch_binance_data(start_time, end_time):
+        client = Client()
+        limit = 1000
+        interval = Client.KLINE_INTERVAL_1MINUTE
+        chunk_days = 60
+        chunk_start = start_time
+        all_chunks = []
+        while chunk_start < end_time:
+            chunk_end = min(chunk_start + datetime.timedelta(days=chunk_days), end_time)
+            start_ts = int(chunk_start.timestamp() * 1000)
+            end_ts = int(chunk_end.timestamp() * 1000)
+            print(f"Fetching data from {chunk_start} to {chunk_end}...")
+            chunk_data = []
+            while start_ts < end_ts:
+                candles = client.get_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    startTime=start_ts,
+                    endTime=end_ts,
+                    limit=limit
+                )
+                if not candles:
+                    break
+                chunk_data.extend(candles)
+                last_open_time = candles[-1][0]
+                start_ts = last_open_time + 60_000
+                time.sleep(0.5)
+            if chunk_data:
+                df_chunk = pd.DataFrame(chunk_data, columns=[
+                    "timestamp", "open", "high", "low", "close", "volume",
+                    "close_time", "quote_asset_volume", "number_of_trades",
+                    "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
+                ])
+                df_chunk["timestamp"] = pd.to_datetime(df_chunk["timestamp"], unit="ms")
+                df_chunk.set_index("timestamp", inplace=True)
+                df_chunk = df_chunk[["open", "high", "low", "close", "volume"]].astype(float)
+                df_chunk['Close'] = df_chunk['close']
+                df_chunk['SMA_10'] = df_chunk['Close'].rolling(window=10).mean()
+                df_chunk['SMA_50'] = df_chunk['Close'].rolling(window=50).mean()
+                df_chunk['RSI'] = ta.momentum.RSIIndicator(close=df_chunk['Close'], window=14).rsi()
+                macd = ta.trend.MACD(close=df_chunk['Close'])
+                df_chunk['MACD'] = macd.macd()
+                df_chunk['MACD_Signal'] = macd.macd_signal()
+                df_chunk = df_chunk.dropna()
+                all_chunks.append(df_chunk)
+                print(f"Fetched and processed chunk ({len(df_chunk)} rows)")
+            chunk_start = chunk_end
+        if all_chunks:
+            all_data = pd.concat(all_chunks)
+            all_data = all_data.sort_index()
+            return all_data
+        else:
+            return pd.DataFrame()
+
+    # Archive existing files if they exist
+    for path in [csv_path, val_csv_path]:
+        if os.path.exists(path):
+            now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_path = f"{path.rstrip('.csv')}_archive_{now}.csv"
+            shutil.move(path, archive_path)
+            print(f"Archived old CSV to {archive_path}")
+
+    # Parse dates
+    def parse_date(date_str, default):
+        return datetime.datetime.strptime(date_str, "%Y%m%d") if date_str else default
+
+    train_df = pd.DataFrame()
+    if train_from_date and train_to_date:
+        train_start = parse_date(train_from_date, datetime.datetime.now() - datetime.timedelta(days=365))
+        train_end = parse_date(train_to_date, datetime.datetime.now() - datetime.timedelta(days=60))
+        train_df = fetch_binance_data(train_start, train_end)
+        train_df.to_csv(csv_path)
+        print(f"Saved training data to {csv_path} ({len(train_df)} rows)")
+    else:
+        print("Training date range not provided, skipping training data fetch.")
+
+    val_start = parse_date(val_from_date, datetime.datetime.now() - datetime.timedelta(days=60))
+    val_end = parse_date(val_to_date, datetime.datetime.now())
+    val_df = fetch_binance_data(val_start, val_end)
+    val_df.to_csv(val_csv_path)
+    print(f"Saved validation data to {val_csv_path} ({len(val_df)} rows)")
+
+    return train_df, val_df

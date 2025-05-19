@@ -13,18 +13,37 @@ if os.path.exists(log_path):
     os.rename(log_path, archive_path)
     print(f"Archived old log file to {archive_path}")
 
-# Use Binance 1-minute data for training
+# Use Binance 1-minute data for training and validation
 csv_path = "data/binance_btc_1m.csv"
-try:
-    df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
-    print(f"Loaded data from {csv_path}")
-except FileNotFoundError:
-    df = get_binance_1m_data(symbol="BTCUSDT", months=12, csv_path=csv_path)
-    df.to_csv(csv_path)
-    print(f"Downloaded and saved data to {csv_path}")
+val_csv_path = "data/binance_btc_1m_val.csv"
 
-env = BTCTradingEnv(df)
+if os.path.exists(csv_path) and os.path.exists(val_csv_path):
+    train_df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+    val_df = pd.read_csv(val_csv_path, index_col=0, parse_dates=True)
+    print(f"Loaded training data from {csv_path}")
+    print(f"Loaded validation data from {val_csv_path}")
+else:
+    train_df, val_df = get_binance_1m_data(
+        symbol="BTCUSDT",
+        train_from_date="20230501", train_to_date="20240501",
+        val_from_date="20240501", val_to_date="20240701",
+        csv_path=csv_path,
+        val_csv_path=val_csv_path
+    )
 
-model = PPO("MlpPolicy", env, verbose=1)
-model.learn(total_timesteps=150_000)
+# Training environment
+train_env = BTCTradingEnv(train_df)
+model = PPO("MlpPolicy", train_env, verbose=1)
+model.learn(total_timesteps=1_500_000)
 model.save("ppo_btc_trend")
+
+# Validation environment (optional: evaluate after training)
+val_env = BTCTradingEnv(val_df)
+obs, info = val_env.reset()
+for _ in range(len(val_df)):
+    action, _ = model.predict(obs)
+    obs, reward, terminated, truncated, _ = val_env.step(action)
+    if val_env.current_step % 10000 == 0:
+        val_env.render()
+    if terminated or truncated:
+        break
