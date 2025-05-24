@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 from collections import deque
 from trading_features import build_observation
-MAX_BUY_FRACTION = 0.05  # 5% of balance
 
 class BTCTradingEnv(gym.Env):
     def __init__(self, df):
@@ -12,12 +11,23 @@ class BTCTradingEnv(gym.Env):
         self.df = df.reset_index(drop=True)
         self.n_steps = len(df)
         self.action_space = spaces.Discrete(7)
-        # 9 original + 5 last trade profits + 5 SMA_10 + 5 SMA_50 = 24
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(39,), dtype=np.float32)
-        self.total_trades = 0
-        self.profitable_trades = 0
-        self.loss_trades = 0
-        self.last_trade_profits = deque([0.0]*5, maxlen=5)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(25 + 10*7 + 10*10,), dtype=np.float32)  # Update shape as needed
+
+        # --- Add deques for new features ---
+        self.sma_10_vals = deque([0.0]*10, maxlen=10)
+        self.sma_50_vals = deque([0.0]*10, maxlen=10)
+        self.ema_10_vals = deque([0.0]*10, maxlen=10)
+        self.ema_50_vals = deque([0.0]*10, maxlen=10)
+        self.sma_diff_vals = deque([0.0]*10, maxlen=10)
+        self.close_sma10_vals = deque([0.0]*10, maxlen=10)
+        self.close_sma50_vals = deque([0.0]*10, maxlen=10)
+        # --- Initialize bb_features ---
+        self.bb_features = {k: deque([0.0]*10, maxlen=10) for k in [
+            "BB_MID", "BB_HIGH", "BB_LOW",
+            "BB_MID_close", "BB_HIGH_close", "BB_LOW_close",
+            "BB_MID_open", "BB_HIGH_open", "BB_LOW_open",
+            "BB_norm_pos"
+        ]}
         self.reset()
 
     def reset(self, *, seed=None, options=None):
@@ -30,18 +40,53 @@ class BTCTradingEnv(gym.Env):
         self.profitable_trades = 0
         self.loss_trades = 0
         self.last_trade_profits = deque([0.0]*5, maxlen=5)
+        # --- Reset new feature deques ---
+        self.sma_10_vals = deque([0.0]*10, maxlen=10)
+        self.sma_50_vals = deque([0.0]*10, maxlen=10)
+        self.ema_10_vals = deque([0.0]*10, maxlen=10)
+        self.ema_50_vals = deque([0.0]*10, maxlen=10)
+        self.sma_diff_vals = deque([0.0]*10, maxlen=10)
+        self.close_sma10_vals = deque([0.0]*10, maxlen=10)
+        self.close_sma50_vals = deque([0.0]*10, maxlen=10)
+        # --- Reset bb_features ---
+        self.bb_features = {k: deque([0.0]*10, maxlen=10) for k in [
+            "BB_MID", "BB_HIGH", "BB_LOW",
+            "BB_MID_close", "BB_HIGH_close", "BB_LOW_close",
+            "BB_MID_open", "BB_HIGH_open", "BB_LOW_open",
+            "BB_norm_pos"
+        ]}
         obs = self._get_obs()
         info = {}
         return obs, info
 
     def _get_obs(self):
-        return build_observation(
+        base_obs = build_observation(
             self.df,
             self.current_step,
             self.balance,
             self.btc_held,
             self.last_trade_profits
         )
+        # --- Add new features to observation ---
+        feature_obs = []
+        feature_obs.extend(list(self.sma_10_vals))
+        feature_obs.extend(list(self.sma_50_vals))
+        feature_obs.extend(list(self.ema_10_vals))
+        feature_obs.extend(list(self.ema_50_vals))
+        feature_obs.extend(list(self.sma_diff_vals))
+        feature_obs.extend(list(self.close_sma10_vals))
+        feature_obs.extend(list(self.close_sma50_vals))
+        # ...existing bb_features code...
+        bb_obs = []
+        for key in [
+            "BB_MID", "BB_HIGH", "BB_LOW",
+            "BB_MID_close", "BB_HIGH_close", "BB_LOW_close",
+            "BB_MID_open", "BB_HIGH_open", "BB_LOW_open",
+            "BB_norm_pos"
+        ]:
+            bb_obs.extend(list(self.bb_features[key]))
+        obs = np.concatenate([base_obs, np.array(feature_obs, dtype=np.float32), np.array(bb_obs, dtype=np.float32)])
+        return obs
 
     def step(self, action, log_file="trading_log.txt"):
         # Ensure action is an int (Stable-Baselines3 may pass a numpy array)
@@ -50,7 +95,48 @@ class BTCTradingEnv(gym.Env):
             
         done = self.current_step >= self.n_steps - 1
         row = self.df.iloc[self.current_step]
-        price = row['Close']
+        open_ = row['open'] if 'open' in row else row['Open']
+        close = row['close'] if 'close' in row else row['Close']
+        price = row['close'] if 'close' in row else row['Close']  # <-- FIX: define price here
+        bb_mid = row['BB_MID']
+        bb_high = row['BB_HIGH']
+        bb_low = row['BB_LOW']
+        bb_mid_close = bb_mid - close
+        bb_high_close = bb_high - close
+        bb_low_close = bb_low - close
+        bb_mid_open = bb_mid - open_
+        bb_high_open = bb_high - open_
+        bb_low_open = bb_low - open_
+        bb_norm_pos = (close - bb_mid) / (bb_high - bb_low + 1e-8)
+
+        self.bb_features["BB_MID"].append(bb_mid)
+        self.bb_features["BB_HIGH"].append(bb_high)
+        self.bb_features["BB_LOW"].append(bb_low)
+        self.bb_features["BB_MID_close"].append(bb_mid_close)
+        self.bb_features["BB_HIGH_close"].append(bb_high_close)
+        self.bb_features["BB_LOW_close"].append(bb_low_close)
+        self.bb_features["BB_MID_open"].append(bb_mid_open)
+        self.bb_features["BB_HIGH_open"].append(bb_high_open)
+        self.bb_features["BB_LOW_open"].append(bb_low_open)
+        self.bb_features["BB_norm_pos"].append(bb_norm_pos)
+
+        # --- Compute new features ---
+        sma_10 = row['SMA_10']
+        sma_50 = row['SMA_50']
+        ema_10 = row['EMA_10']
+        ema_50 = row['EMA_50']
+        sma_diff = sma_10 - sma_50
+        close_sma10 = row['close'] - sma_10
+        close_sma50 = row['close'] - sma_50
+        # --- Append to deques ---
+        self.sma_10_vals.append(sma_10)
+        self.sma_50_vals.append(sma_50)
+        self.ema_10_vals.append(ema_10)
+        self.ema_50_vals.append(ema_50)
+        self.sma_diff_vals.append(sma_diff)
+        self.close_sma10_vals.append(close_sma10)
+        self.close_sma50_vals.append(close_sma50)
+
         trade_trace = ""
         large_trade_penalty = 0  # Default value for all actions
         # Track if a trade was made
@@ -60,9 +146,11 @@ class BTCTradingEnv(gym.Env):
         if action == 0:  # Sell All
             if self.btc_held > 0:
                 sell_value = self.btc_held * price
-                profit_loss = sell_value - 0  # If you want to track buy price, you can store it and use here
-                trade_trace = f"SELL: Sold {self.btc_held:.6f} BTC at {price:.2f} for {sell_value:.2f} USD. Profit/Loss: {sell_value - 0:.2f} USD\n"
-                self.balance += sell_value
+                fee = sell_value * 0.001  # 0.1% fee
+                net_sell_value = sell_value - fee
+                profit_loss = net_sell_value - 0  # If you want to track buy price, you can store it and use here
+                trade_trace = f"SELL: Sold {self.btc_held:.6f} BTC at {price:.2f} for {net_sell_value:.2f} USD (fee: {fee:.2f}). Profit/Loss: {net_sell_value - 0:.2f} USD\n"
+                self.balance += net_sell_value
                 self.btc_held = 0
                 large_trade_penalty = 0
                 trade_made = True
@@ -71,29 +159,26 @@ class BTCTradingEnv(gym.Env):
                 trade_trace = f"SELL: Tried to sell with 0 BTC at {price:.2f} -- strongly discouraged\n"
                 large_trade_penalty = -5  # Strongly discourage selling with no BTC
         elif action >= 1:  # Buy actions (action 1+)
-            # Define buy fractions: 0.5% to 10% (0.005 to 0.10, step 0.005), then 11% to 30% (0.11 to 0.30, step 0.01)
-            buy_fractions = [0] + [round(x * 0.005, 3) for x in range(1, 21)] + [round(0.10 + x * 0.01, 3) for x in range(1, 21)]
-            # action 1 = 0.5%, 2 = 1%, ..., 20 = 10%, 21 = 11%, ..., 40 = 30%
-            buy_fraction = float(buy_fractions[action]) if action < len(buy_fractions) else 0.0
+            buy_fraction = min(action * 0.01, 1.0)
             max_buy = float(self.balance) * buy_fraction
             min_trade_btc = 0.00001  # Minimum trade size
+            # Apply 0.1% fee to the amount spent
+            total_cost = max_buy * 1.001
             btc_bought = max_buy / float(price) if price > 0 else 0.0
-            if max_buy > 0 and self.balance >= max_buy and buy_fraction > 0 and btc_bought >= min_trade_btc:
+            if total_cost > 0 and self.balance >= total_cost and buy_fraction > 0 and btc_bought >= min_trade_btc:
                 self.btc_held += btc_bought
-                self.balance -= max_buy
+                self.balance -= total_cost
                 trade_made = True
-                # Penalty/Reward logic
-                if buy_fraction <= 0.025:
-                    large_trade_penalty = 5  # Strongly encourage very small trades
-                elif buy_fraction <= 0.05:
-                    large_trade_penalty = 3  # Encourage small trades
+                # Penalty/Reward logic: lower buy_fraction = better reward, >0.3 = extremely discouraged
+                if buy_fraction <= 0.05:
+                    large_trade_penalty = 2  # Encourage small trades
                 elif buy_fraction <= 0.10:
                     large_trade_penalty = 1  # Mildly encourage up to 10%
                 elif buy_fraction <= 0.30:
-                    large_trade_penalty = -3  # Discourage 11-30%
+                    large_trade_penalty = -2  # Discourage 11-30%
                 else:
-                    large_trade_penalty = -10  # Strongly discourage >30%
-                trade_trace = f"BUY {buy_fraction*100:.1f}%: Bought {btc_bought:.6f} BTC at {price:.2f} for {max_buy:.2f} USD\n"
+                    large_trade_penalty = -10  # Extremely discourage >30%
+                trade_trace = f"BUY {buy_fraction*100:.1f}%: Bought {btc_bought:.6f} BTC at {price:.2f} for {max_buy:.2f} USD (fee: {total_cost - max_buy:.2f}, total: {total_cost:.2f})\n"
                 trade_profit = 0  # For buys, profit is not realized yet
             else:
                 btc_bought = 0
@@ -122,6 +207,7 @@ class BTCTradingEnv(gym.Env):
         inactivity_penalty = -0.2 if not trade_made else 0
         reward = profit * 0.002 - drawdown * 5 + large_trade_penalty + trade_bonus + inactivity_penalty
         terminated = done
+
         truncated = False
         info = {
             "net_worth": net_worth,
