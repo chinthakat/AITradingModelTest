@@ -11,7 +11,8 @@ class BTCTradingEnv(gym.Env):
         self.df = df.reset_index(drop=True)
         self.n_steps = len(df)
         self.action_space = spaces.Discrete(7)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(25 + 10*7 + 10*10,), dtype=np.float32)  # Update shape as needed
+        # Fix: set the correct shape to match your actual observation vector
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(206,), dtype=np.float32)
 
         # --- Add deques for new features ---
         self.sma_10_vals = deque([0.0]*10, maxlen=10)
@@ -29,16 +30,22 @@ class BTCTradingEnv(gym.Env):
             "BB_norm_pos"
         ]}
         self.reset()
+        self.steps_since_last_trade = 100  # Large initial value
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.balance = 10_000
-        self.btc_held = 0
+        self.balance = 10_000      # Reset balance for every run
+        self.btc_held = 0.05       # Reset BTC held for every run
         self.current_step = 0
-        self.max_net_worth = self.balance
+        self.original_net_worth = self.balance + self.btc_held * (
+            self.df.iloc[0]['close'] if 'close' in self.df.columns else self.df.iloc[0]['Close']
+        )
+        self.max_net_worth = self.original_net_worth
         self.total_trades = 0
         self.profitable_trades = 0
         self.loss_trades = 0
+        self.buy_trades = 0
+        self.sell_trades = 0
         self.last_trade_profits = deque([0.0]*5, maxlen=5)
         # --- Reset new feature deques ---
         self.sma_10_vals = deque([0.0]*10, maxlen=10)
@@ -55,9 +62,9 @@ class BTCTradingEnv(gym.Env):
             "BB_MID_open", "BB_HIGH_open", "BB_LOW_open",
             "BB_norm_pos"
         ]}
-        obs = self._get_obs()
-        info = {}
-        return obs, info
+        self.steps_since_last_trade = 100
+        self.prev_net_worth = self.original_net_worth
+        return self._get_obs(), {}
 
     def _get_obs(self):
         base_obs = build_observation(
@@ -85,7 +92,17 @@ class BTCTradingEnv(gym.Env):
             "BB_norm_pos"
         ]:
             bb_obs.extend(list(self.bb_features[key]))
-        obs = np.concatenate([base_obs, np.array(feature_obs, dtype=np.float32), np.array(bb_obs, dtype=np.float32)])
+        # Calculate current profit (net_worth - prev_net_worth)
+        net_worth = self.balance + self.btc_held * (
+            self.df.iloc[self.current_step]['close'] if 'close' in self.df.columns else self.df.iloc[self.current_step]['Close']
+        )
+        current_profit = net_worth - self.prev_net_worth
+        obs = np.concatenate([
+            base_obs,
+            np.array([current_profit], dtype=np.float32),  # Add current profit as an important observation
+            np.array(feature_obs, dtype=np.float32),
+            np.array(bb_obs, dtype=np.float32)
+        ])
         return obs
 
     def step(self, action, log_file="trading_log.txt"):
@@ -143,23 +160,108 @@ class BTCTradingEnv(gym.Env):
         trade_made = False
         trade_profit = None  # Track profit/loss for this trade
         # Trade execution
-        if action == 0:  # Sell All
-            if self.btc_held > 0:
-                sell_value = self.btc_held * price
+        if action == 0:  # Hold
+            trade_trace = f"HOLD: No action taken at {price:.2f}\n"
+            large_trade_penalty = 0.5
+
+        elif action == 1:  # Sell 10% of BTC held
+            sell_fraction = 0.1
+            btc_to_sell = self.btc_held * sell_fraction
+            min_trade_btc = 0.00001
+            if btc_to_sell > min_trade_btc and self.btc_held >= btc_to_sell:
+                sell_value = btc_to_sell * price
                 fee = sell_value * 0.001  # 0.1% fee
                 net_sell_value = sell_value - fee
-                profit_loss = net_sell_value - 0  # If you want to track buy price, you can store it and use here
-                trade_trace = f"SELL: Sold {self.btc_held:.6f} BTC at {price:.2f} for {net_sell_value:.2f} USD (fee: {fee:.2f}). Profit/Loss: {net_sell_value - 0:.2f} USD\n"
+                self.btc_held -= btc_to_sell
                 self.balance += net_sell_value
-                self.btc_held = 0
-                large_trade_penalty = 0
                 trade_made = True
-                trade_profit = profit_loss
+                self.sell_trades += 1
+                large_trade_penalty = 2
+                trade_trace = f"SELL 10%: Sold {btc_to_sell:.6f} BTC at {price:.2f} for {net_sell_value:.2f} USD (fee: {fee:.2f})\n"
+                trade_profit = net_sell_value - 0
             else:
-                trade_trace = f"SELL: Tried to sell with 0 BTC at {price:.2f} -- strongly discouraged\n"
-                large_trade_penalty = -5  # Strongly discourage selling with no BTC
-        elif action >= 1:  # Buy actions (action 1+)
-            buy_fraction = min(action * 0.01, 1.0)
+                trade_trace = f"SELL 10%: Tried to sell with {self.btc_held:.6f} BTC at {price:.2f} -- discouraged\n"
+                large_trade_penalty = -5
+
+        elif action == 2:  # Sell 25% of BTC held
+            sell_fraction = 0.25
+            btc_to_sell = self.btc_held * sell_fraction
+            min_trade_btc = 0.00001
+            if btc_to_sell > min_trade_btc and self.btc_held >= btc_to_sell:
+                sell_value = btc_to_sell * price
+                fee = sell_value * 0.001
+                net_sell_value = sell_value - fee
+                self.btc_held -= btc_to_sell
+                self.balance += net_sell_value
+                trade_made = True
+                self.sell_trades += 1
+                large_trade_penalty = 1.5
+                trade_trace = f"SELL 25%: Sold {btc_to_sell:.6f} BTC at {price:.2f} for {net_sell_value:.2f} USD (fee: {fee:.2f})\n"
+                trade_profit = net_sell_value - 0
+            else:
+                trade_trace = f"SELL 25%: Tried to sell with {self.btc_held:.6f} BTC at {price:.2f} -- discouraged\n"
+                large_trade_penalty = -5
+
+        elif action == 3:  # Sell 50% of BTC held
+            sell_fraction = 0.5
+            btc_to_sell = self.btc_held * sell_fraction
+            min_trade_btc = 0.00001
+            if btc_to_sell > min_trade_btc and self.btc_held >= btc_to_sell:
+                sell_value = btc_to_sell * price
+                fee = sell_value * 0.001
+                net_sell_value = sell_value - fee
+                self.btc_held -= btc_to_sell
+                self.balance += net_sell_value
+                trade_made = True
+                self.sell_trades += 1
+                large_trade_penalty = 1
+                trade_trace = f"SELL 50%: Sold {btc_to_sell:.6f} BTC at {price:.2f} for {net_sell_value:.2f} USD (fee: {fee:.2f})\n"
+                trade_profit = net_sell_value - 0
+            else:
+                trade_trace = f"SELL 50%: Tried to sell with {self.btc_held:.6f} BTC at {price:.2f} -- discouraged\n"
+                large_trade_penalty = -5
+
+        elif action == 4:  # Sell 75% of BTC held
+            sell_fraction = 0.75
+            btc_to_sell = self.btc_held * sell_fraction
+            min_trade_btc = 0.00001
+            if btc_to_sell > min_trade_btc and self.btc_held >= btc_to_sell:
+                sell_value = btc_to_sell * price
+                fee = sell_value * 0.001
+                net_sell_value = sell_value - fee
+                self.btc_held -= btc_to_sell
+                self.balance += net_sell_value
+                trade_made = True
+                self.sell_trades += 1
+                large_trade_penalty = 0.75
+                trade_trace = f"SELL 75%: Sold {btc_to_sell:.6f} BTC at {price:.2f} for {net_sell_value:.2f} USD (fee: {fee:.2f})\n"
+                trade_profit = net_sell_value - 0
+            else:
+                trade_trace = f"SELL 75%: Tried to sell with {self.btc_held:.6f} BTC at {price:.2f} -- discouraged\n"
+                large_trade_penalty = -0.5
+
+        elif action == 5:  # Sell 100% of BTC held
+            sell_fraction = 1.0
+            btc_to_sell = self.btc_held * sell_fraction
+            min_trade_btc = 0.00001
+            if btc_to_sell > min_trade_btc and self.btc_held >= btc_to_sell:
+                sell_value = btc_to_sell * price
+                fee = sell_value * 0.001
+                net_sell_value = sell_value - fee
+                self.btc_held -= btc_to_sell
+                self.balance += net_sell_value
+                trade_made = True
+                self.sell_trades += 1
+                large_trade_penalty = -1
+                trade_trace = f"SELL 100%: Sold {btc_to_sell:.6f} BTC at {price:.2f} for {net_sell_value:.2f} USD (fee: {fee:.2f})\n"
+                trade_profit = net_sell_value - 0
+            else:
+                trade_trace = f"SELL 100%: Tried to sell with {self.btc_held:.6f} BTC at {price:.2f} -- discouraged\n"
+                large_trade_penalty = 0
+
+        # BUY logic remains unchanged
+        elif action >= 6:
+            buy_fraction = min((action - 5) * 0.01, 1.0)
             max_buy = float(self.balance) * buy_fraction
             min_trade_btc = 0.00001  # Minimum trade size
             # Apply 0.1% fee to the amount spent
@@ -169,15 +271,16 @@ class BTCTradingEnv(gym.Env):
                 self.btc_held += btc_bought
                 self.balance -= total_cost
                 trade_made = True
+                self.buy_trades += 1
                 # Penalty/Reward logic: lower buy_fraction = better reward, >0.3 = extremely discouraged
                 if buy_fraction <= 0.05:
                     large_trade_penalty = 2  # Encourage small trades
                 elif buy_fraction <= 0.10:
                     large_trade_penalty = 1  # Mildly encourage up to 10%
                 elif buy_fraction <= 0.30:
-                    large_trade_penalty = -2  # Discourage 11-30%
+                    large_trade_penalty = -0.5  # Discourage 11-30%
                 else:
-                    large_trade_penalty = -10  # Extremely discourage >30%
+                    large_trade_penalty = -1  # Extremely discourage >30%
                 trade_trace = f"BUY {buy_fraction*100:.1f}%: Bought {btc_bought:.6f} BTC at {price:.2f} for {max_buy:.2f} USD (fee: {total_cost - max_buy:.2f}, total: {total_cost:.2f})\n"
                 trade_profit = 0  # For buys, profit is not realized yet
             else:
@@ -192,20 +295,59 @@ class BTCTradingEnv(gym.Env):
                     self.profitable_trades += 1
                 elif trade_profit < 0:
                     self.loss_trades += 1
-        # After trade_profit is set (after trade_made)
-        if trade_made and trade_profit is not None:
-            self.last_trade_profits.append(trade_profit)
-        self.current_step += 1
-        next_obs = np.zeros(self.observation_space.shape, dtype=np.float32) if self.current_step >= self.n_steps else self._get_obs()
-        # Net worth and drawdown
+
         net_worth = self.balance + self.btc_held * price
         drawdown = (self.max_net_worth - net_worth) / self.max_net_worth if self.max_net_worth > 0 else 0
         self.max_net_worth = max(self.max_net_worth, net_worth)
-        # Reward: growth - drawdown - large_trade_penalty + trade bonus - inactivity penalty
-        profit = net_worth - 10_000
-        trade_bonus = 0.5 if trade_made else 0
+        profit = net_worth - self.original_net_worth
+
+        # Calculate current profit (net_worth - prev_net_worth)
+        current_profit = net_worth - self.prev_net_worth 
+        # --- Save current net worth as previous for next step ---
+        self.prev_net_worth = net_worth
+        # After trade_profit is set (after trade_made)
+        if trade_made and current_profit is not None:
+            self.last_trade_profits.append(current_profit)
+        self.current_step += 1
+        next_obs = np.zeros(self.observation_space.shape, dtype=np.float32) if self.current_step >= self.n_steps else self._get_obs()
+        # Net worth and drawdown
+  
+
+      
+
+        # Use original net worth for profit calculation
+        trade_bonus = 0.5 if (current_profit > 0 and trade_made) else 0
         inactivity_penalty = -0.2 if not trade_made else 0
-        reward = profit * 0.002 - drawdown * 5 + large_trade_penalty + trade_bonus + inactivity_penalty
+        # Add penalty for trading too frequently
+        trade_frequency_penalty = 0
+        if  self.steps_since_last_trade > 100:
+            trade_frequency_penalty = -(1 + self.steps_since_last_trade*0.01)
+
+        if current_profit < 0:
+            large_trade_penalty = 0
+        # --- Updated reward: positive if profit, negative if loss (per trade) ---
+        trade_profit_reward = 0
+        
+        
+        if current_profit is not None:
+            if current_profit > 0:
+                trade_profit_reward = 4  # Positive reward proportional to profit
+            elif current_profit < 0:
+                trade_profit_reward = -4  # Negative reward proportional to loss
+        
+        current_profit_reward = current_profit * 0.01
+        if current_profit < 0:
+            current_profit_reward = current_profit * 0.5
+        reward = (
+            profit * 0.002
+            - drawdown * 5
+            + large_trade_penalty
+            + trade_bonus
+            + inactivity_penalty
+            + trade_frequency_penalty
+            + trade_profit_reward
+            +current_profit_reward  # <-- Add this to the reward
+        )
         terminated = done
 
         truncated = False
@@ -215,12 +357,66 @@ class BTCTradingEnv(gym.Env):
             "total_trades": self.total_trades,
             "profitable_trades": self.profitable_trades,
             "loss_trades": self.loss_trades,
+            "buy_trades": self.buy_trades,
+            "sell_trades": self.sell_trades,
+            "net_worth_at_step": net_worth,
+            "total_buy_trades": self.buy_trades,
+            "total_sell_trades": self.sell_trades,
+            "original_net_worth": self.original_net_worth,  # Optionally add for logging
+            "current_profit": current_profit,  # <-- Add current profit to info
         }
-        # Trace log for buy/sell
-        if trade_trace and self.total_trades % 10000 == 0:
-            print(trade_trace, end="")
+
+        # Print info dict to terminal and log file every 100 steps
+        if self.current_step % 2500 == 0 or terminated:
+            info_line = (
+                f"[INFO] Step: {self.current_step} | "
+                f"Original Net Worth: {info.get('original_net_worth', 0):.2f} | "
+                f"Net Worth: {info['net_worth']:.2f} | "
+                f"Total Trades: {info['total_trades']} | "
+                f"Buy Trades: {info['buy_trades']} | "
+                f"Sell Trades: {info['sell_trades']} | "
+                f"Profit: {info['net_worth'] - info.get('original_net_worth', 0):.2f} | "
+                f"Current Profit: {info['current_profit']:.2f} | "  # <-- Log current profit
+                f"Profitable Trades: {info['profitable_trades']} | "
+                f"Loss Trades: {info['loss_trades']}\n"
+            )
+            print(info_line, end="")
             with open(log_file, "a") as f:
-                f.write(trade_trace)
+                f.write(info_line)
+
+
+        # Trace log for buy/sell with reward details
+        if trade_made and self.total_trades % 5000 == 0:
+            trade_type = "BUY" if action >= 6 else "SELL"
+            trade_amount = 0
+            trade_fraction = 0
+            if trade_type == "BUY":
+                trade_amount = btc_bought if 'btc_bought' in locals() else 0
+                trade_fraction = buy_fraction
+            else:
+                trade_amount = btc_to_sell if 'btc_to_sell' in locals() else 0
+                trade_fraction = sell_fraction
+            reward_details = (
+                f"\n[TRADE] Step: {self.current_step} | Type: {trade_type}\n"
+                f"  Amount: {trade_amount:.6f} BTC\n"
+                f"  USD/AUD Amount: {trade_amount * price:.2f}\n"
+                f"  Trade %: {trade_fraction}%\n"
+                f"  Net Worth: {net_worth:.2f}\n"
+                f"  Current Profit: {current_profit:.2f}\n"
+                f"  Reward: {reward:.4f}\n"
+                f"  Breakdown:\n"
+                f"    profit*0.002           = {profit*0.002:.4f}\n"
+                f"    -drawdown*5            = {-drawdown*5:.4f}\n"
+                f"    large_trade_penalty    = {large_trade_penalty:.4f}\n"
+                f"    trade_bonus            = {trade_bonus:.4f}\n"
+                f"    inactivity_penalty     = {inactivity_penalty:.4f}\n"
+                f"    trade_frequency_penalty= {trade_frequency_penalty:.4f}\n"
+                f"    trade_profit_reward    = {trade_profit_reward:.4f}\n"
+                f"    current_profit_reward  = {current_profit_reward:.4f}\n"
+            )
+            print(reward_details, end="")
+            with open(log_file, "a") as f:
+                f.write(reward_details)
         return next_obs, reward, terminated, truncated, info
 
     def render(self, log_file="trading_log.txt"):
